@@ -1,5 +1,5 @@
 #!/bin/bash
-sh_v="4.5.15"
+sh_v="4.5.16"
 
 
 gl_hui='\e[37m'
@@ -12,7 +12,7 @@ gl_zi='\033[35m'
 gl_kjlan='\033[96m'
 
 
-canshu="CN"
+canshu="default"
 permission_granted="false"
 ENABLE_STATS="true"
 KPANEL_WEB_CERTIFICATE_PROTOCOL_VERSION="1"
@@ -1177,31 +1177,53 @@ block_ip() {
 
 
 
+ddos_rule_add_once() {
+	local chain="$1"
+	shift
+	if iptables -C "$chain" "$@" >/dev/null 2>&1; then
+		return 0
+	fi
+	iptables -A "$chain" "$@"
+}
+
+ddos_rule_remove_all() {
+	local chain="$1" status
+	shift
+	while true; do
+		if iptables -C "$chain" "$@" >/dev/null 2>&1; then
+			iptables -D "$chain" "$@" || return $?
+		else
+			status=$?
+			[ "$status" -eq 1 ] && return 0
+			return "$status"
+		fi
+	done
+}
+
 enable_ddos_defense() {
-	# 开启防御 DDoS
-	iptables -A DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT
-	iptables -A DOCKER-USER -p tcp --syn -j DROP
-	iptables -A DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT
-	iptables -A DOCKER-USER -p udp -j DROP
-	iptables -A INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT
-	iptables -A INPUT -p tcp --syn -j DROP
-	iptables -A INPUT -p udp -m limit --limit 3000/s -j ACCEPT
-	iptables -A INPUT -p udp -j DROP
+	# Ensure each fixed DDoS rule exists once, so enabling repairs partial state safely.
+	ddos_rule_add_once DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT || return $?
+	ddos_rule_add_once DOCKER-USER -p tcp --syn -j DROP || return $?
+	ddos_rule_add_once DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT || return $?
+	ddos_rule_add_once DOCKER-USER -p udp -j DROP || return $?
+	ddos_rule_add_once INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT || return $?
+	ddos_rule_add_once INPUT -p tcp --syn -j DROP || return $?
+	ddos_rule_add_once INPUT -p udp -m limit --limit 3000/s -j ACCEPT || return $?
+	ddos_rule_add_once INPUT -p udp -j DROP || return $?
 
 	send_stats "开启DDoS防御"
 }
 
 # 关闭DDoS防御
 disable_ddos_defense() {
-	# 关闭防御 DDoS
-	iptables -D DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT 2>/dev/null
-	iptables -D DOCKER-USER -p tcp --syn -j DROP 2>/dev/null
-	iptables -D DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT 2>/dev/null
-	iptables -D DOCKER-USER -p udp -j DROP 2>/dev/null
-	iptables -D INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT 2>/dev/null
-	iptables -D INPUT -p tcp --syn -j DROP 2>/dev/null
-	iptables -D INPUT -p udp -m limit --limit 3000/s -j ACCEPT 2>/dev/null
-	iptables -D INPUT -p udp -j DROP 2>/dev/null
+	# Remove all copies of the fixed rules, including duplicates from earlier enables.
+	local chain
+	for chain in DOCKER-USER INPUT; do
+		ddos_rule_remove_all "$chain" -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT || return $?
+		ddos_rule_remove_all "$chain" -p tcp --syn -j DROP || return $?
+		ddos_rule_remove_all "$chain" -p udp -m limit --limit 3000/s -j ACCEPT || return $?
+		ddos_rule_remove_all "$chain" -p udp -j DROP || return $?
+	done
 
 	send_stats "关闭DDoS防御"
 }
@@ -1550,7 +1572,7 @@ install_ldnmp_conf() {
 
   # 创建必要的目录和文件
   cd /home && mkdir -p web/html web/mysql web/certs web/conf.d web/stream.d web/redis web/log/nginx web/letsencrypt && touch web/docker-compose.yml
-  wget -O /home/web/nginx.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/nginx10.conf
+  nginx_template_install || return $?
   wget -O /home/web/conf.d/default.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default10.conf
 
   default_server_ssl
@@ -2474,6 +2496,9 @@ import time
 import urllib.parse
 import urllib.request
 
+# Multi-arch manifest verified from the published 1.31.8-alpine tag.
+WAF_CANDIDATE_IMAGE = 'kjlion/nginx:alpine@sha256:065a40f37e508787769513aca655fc541acf687afffd57b25241b1a6bac53ef8'
+
 LEGACY = '99f7169d84901be3f34452f375b3e0079cd86b4c'
 PREVIOUS = '8773850871f991b027f62841fde2795121251620'
 REVISION = 'bdb8cc42fb123b09b02dc5940d2596354efebb87'
@@ -3163,7 +3188,9 @@ def waf_image_plan(root, model, container):
     """Edit only the active nginx image declaration, then verify the full model."""
     official = r'(?:(?:docker\.io/)?library/|docker\.io/)?nginx(?::[\w.-]+|@sha256:[0-9a-f]{64})?'
     service = model['services']['nginx']
-    if service.get('build') or not re.fullmatch(official, service.get('image', '')):
+    image = service.get('image', '')
+    owned_waf_image = image in {'kjlion/nginx:alpine', 'docker.io/kjlion/nginx:alpine', WAF_CANDIDATE_IMAGE}
+    if service.get('build') or not (re.fullmatch(official, image) or owned_waf_image):
         raise ValueError('仅自动迁移官方 nginx 镜像；自定义镜像请先核对 ModSecurity 兼容性')
     sources = container['Config'].get('Labels', {}).get('com.docker.compose.project.config_files', '')
     paths = [Path(name) for name in sources.split(',') if name]
@@ -3200,7 +3227,7 @@ def waf_image_plan(root, model, container):
             if 'nginx' not in document.get('services', {}):
                 continue
             explicit = 'image' in document['services']['nginx']
-            document['services']['nginx']['image'] = 'kjlion/nginx:alpine'
+            document['services']['nginx']['image'] = WAF_CANDIDATE_IMAGE
             candidate = path.name, (json.dumps(document, ensure_ascii=False) + '\n').encode()
             if explicit:
                 return candidate
@@ -3231,9 +3258,9 @@ def waf_image_plan(root, model, container):
             newline = '\r\n' if line.endswith('\r\n') else '\n'
             for offset in range(index + 1, end):
                 if re.match(r'^ {%d}image\s*:' % child, lines[offset]):
-                    lines[offset] = ' ' * child + 'image: kjlion/nginx:alpine' + newline
+                    lines[offset] = ' ' * child + 'image: ' + WAF_CANDIDATE_IMAGE + newline
                     return path.name, ''.join(lines).encode()
-            lines.insert(index + 1, ' ' * child + 'image: kjlion/nginx:alpine' + newline)
+            lines.insert(index + 1, ' ' * child + 'image: ' + WAF_CANDIDATE_IMAGE + newline)
             if insertion is None:
                 insertion = path.name, ''.join(lines).encode()
             break
@@ -3273,21 +3300,30 @@ def execute_update(root, directory, component, prefix):
             previous[name] = {'image': containers[0]['Image'],
                               'running': any(item['State']['Running'] for item in containers)}
     json_write(directory / 'images.json', {'services': services, 'previous': previous})
-    if component == 'waf':
+    managed_waf_tag = bool(
+        component != 'waf' and nginx_container is not None and
+        model['services']['nginx'].get('image') in {'kjlion/nginx:alpine', 'docker.io/kjlion/nginx:alpine'}
+    )
+    if component == 'waf' or managed_waf_tag:
         if nginx_container is None or not nginx_container['State']['Running']:
-            raise ValueError('WAF 自动迁移需要单个运行中的 nginx 容器')
-        journal = json.loads((directory / 'journal.json').read_text(encoding='utf-8'))
-        journal['component'] = 'waf'
-        json_write(directory / 'journal.json', journal)
+            if component == 'waf':
+                raise ValueError('WAF 自动迁移需要单个运行中的 nginx 容器')
+        if component == 'waf':
+            journal = json.loads((directory / 'journal.json').read_text(encoding='utf-8'))
+            journal['component'] = 'waf'
+            json_write(directory / 'journal.json', journal)
         name, data = waf_image_plan(root, model, nginx_container)
         remember(root, directory)
         install_configuration(root, directory, name, data, inventory(root)[name]['mode'])
         desired = copy.deepcopy(model)
-        desired['services']['nginx']['image'] = 'kjlion/nginx:alpine'
+        desired['services']['nginx']['image'] = WAF_CANDIDATE_IMAGE
         model = json.loads(command('docker', 'compose', '--project-directory', str(root), 'config', '--format', 'json'))
         if model != desired:
             raise ValueError('镜像迁移改变了其他有效 Compose 参数，已中止: ' + ', '.join(changed_paths(desired, model)[:10]))
-        compose = compose_file(directory, 'target.json', model)
+        if component == 'waf':
+            compose = compose_file(directory, 'target.json', model)
+        else:
+            compose = compose_file(directory, 'pinned.json', model)
     if component == 'all':
         snapshot_runtime(directory, compose, previous)
     command(*compose, 'pull', *services)
@@ -3749,14 +3785,15 @@ kpanel_app_delete_sites() {
 
 
 shared_waf_revision() {
-	printf '%s\n' '5016282f572c1fc4827c912b4dffe7016865352e'
+	printf '%s\n' '4269829b5be389aa08c22a0c19915a5a451a7e2f'
 }
 
 shared_waf_manifest() {
 	cat <<'WAF_MANIFEST'
-cf02c5babd0b72baacbd639d9e39f6559a86839c77b05af15deb04a668c82af9  configure.py
-0c7429a393ec213bbcc5cd93c9077fcd64944e3750abfc256234a8fb6202c755  policy.py
+832eef6992bd92cbe090ecb13f32b361b5a4e49b023d39417a5a9bc46ed7a4a7  configure.py
+f00fa5846217315b9f0905ddab9c7104959e77f0b1653fb4ffbf5ff48121df9a  policy.py
 99071ba780da3c7a843fda8aa348dba87fc9ebd022bb7cbbca2b8fa33f69a0a9  nginx_edit.py
+5537bbf5aeb44865562484ea7ef403d809d68a6dbd5c7972d6dbc5b58775b1f1  ban.py
 aee6fd651ceb6441acce6dc6b510e504d7127b2bba1ce84ca361655590c615b0  example-policy.json
 e6be6df199bc4ad607b6bcd7273a62a4884e5aa841786db1d8d5a2284f573179  cloudflare-ips.json
 6fd82147b99201beebe7b1a983f146e5c23ade7f9454ac883830848b7f753e30  legacy-jails.local
@@ -3773,7 +3810,7 @@ shared_waf_verified() {
 		[[ "$checksum" =~ ^[0-9a-f]{64}$ ]] || return 1
 		case "$seen" in *"|$filename|"*) return 1 ;; esac
 		seen="${seen}${filename}|"; count=$((count + 1))
-		case "$filename" in configure.py|policy.py|nginx_edit.py|example-policy.json|cloudflare-ips.json|legacy-jails.local) ;;
+		case "$filename" in configure.py|policy.py|nginx_edit.py|ban.py|example-policy.json|cloudflare-ips.json|legacy-jails.local) ;;
 			*) return 1 ;;
 		esac
 		[ -f "$directory/$filename" ] && [ ! -L "$directory/$filename" ] || return 1
@@ -3782,7 +3819,7 @@ shared_waf_verified() {
 		(( (8#$mode & 8#022) == 0 )) || return 1
 		[ "$(sha256sum "$directory/$filename" | awk '{print $1}')" = "$checksum" ] || return 1
 	done < <(shared_waf_manifest)
-	[ "$count" -eq 6 ] && [ "$(find "$directory" -mindepth 1 -maxdepth 1 | wc -l)" -eq 6 ]
+	[ "$count" -eq 7 ] && [ "$(find "$directory" -mindepth 1 -maxdepth 1 | wc -l)" -eq 7 ]
 }
 
 shared_waf_prepare() {
@@ -3808,6 +3845,7 @@ for parent in [path,*path.parents]:
   raise SystemExit('WAF 配置目录所有权或权限不可信')
 if path.exists():
  count=total=0
+ known={"configure.py","policy.py","nginx_edit.py","ban.py","example-policy.json","cloudflare-ips.json","legacy-jails.local"}
  for entry in path.iterdir():
   count+=1
   if count>16:raise SystemExit('WAF 版本缓存上限16份，请先归档旧版本')
@@ -3816,7 +3854,7 @@ if path.exists():
   children=0
   for child in entry.iterdir():
    children+=1
-   if children>6:raise SystemExit('WAF 缓存含未知文件')
+   if child.name not in known or children>7:raise SystemExit('WAF 缓存含未知文件')
    if child.is_symlink() or not child.is_file():raise SystemExit('WAF 缓存含未知文件类型')
    total+=child.stat().st_size
    if total>64*1024*1024:raise SystemExit('WAF 版本缓存超过64MiB，请先归档')
@@ -3832,7 +3870,7 @@ WAF_PATH
 	fi
 	(
 	stage=$(mktemp -d "$base/.stage.XXXXXX") || return 1
-	trap 'for filename in configure.py policy.py nginx_edit.py example-policy.json cloudflare-ips.json legacy-jails.local; do rm -f -- "$stage/$filename"; done; rmdir -- "$stage" 2>/dev/null || true' EXIT
+	trap 'for filename in configure.py policy.py nginx_edit.py ban.py example-policy.json cloudflare-ips.json legacy-jails.local; do rm -f -- "$stage/$filename"; done; rmdir -- "$stage" 2>/dev/null || true' EXIT
 	chmod 700 "$stage" || exit 1
 	while read -r checksum filename; do
 		if ! "$WAF_PYTHON" -I - "${gh_proxy:-https://}raw.githubusercontent.com/kejilion/nginx/$revision/waf/$filename" "$stage/$filename" <<'WAF_DOWNLOAD'
@@ -3873,6 +3911,10 @@ shared_waf_cached() {
 	revision=$(shared_waf_revision)
 	[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
 	WAF_DIRECTORY="/home/web/config/waf/packages/$revision"
+	if [ ! -d "$WAF_DIRECTORY" ]; then
+		echo "共享 WAF 包尚未导入；运行防护安装/迁移可安全补齐，状态查询不会自动下载。" >&2
+		return 1
+	fi
 	WAF_PYTHON=""
 	for interpreter in python3 python3.13 python3.12 python3.11; do
 		if command -v "$interpreter" >/dev/null 2>&1 && "$interpreter" -I -c 'import sys; raise SystemExit(sys.version_info < (3,11))' >/dev/null 2>&1; then
@@ -3895,8 +3937,8 @@ WAF_CACHED_PATH
 shared_waf() {
 	# Native CLI requires action-first syntax; reject options before any preparation.
 	case "${1:-}" in
-		status) shared_waf_cached || return 1 ;;
-		plan|apply|configure|doctor|rollback|refresh-ips|retire-jails|existing-filters|rotation|trust-cloudflare) shared_waf_prepare || return 1 ;;
+		status|ban-status) shared_waf_cached || return 1 ;;
+		plan|apply|configure|doctor|rollback|refresh-ips|retire-jails|existing-filters|rotation|trust-cloudflare|ban-preflight|ban-install|ban-clear|ban-remove|cf-on|cf-off) shared_waf_prepare || return 1 ;;
 		*) echo "用法: k web waf <action> [options]；状态查询: k web waf status" >&2; return 2 ;;
 	esac
 	"$WAF_PYTHON" -E -s -B "$WAF_DIRECTORY/configure.py" --root /home/web "$@"
@@ -4020,10 +4062,75 @@ check_waf_status() {
 
 
 check_cf_mode() {
-	if [ -f "/etc/fail2ban/action.d/cloudflare-docker.conf" ]; then
-		CFmessage=" cf模式已开启"
+	CFmessage=""
+	[ -f /home/web/config/waf/ban-cf.json ] || {
+		[ ! -f /etc/fail2ban/action.d/cloudflare-docker.conf ] || CFmessage=" CF旧配置待迁移"
+		return 0
+	}
+	local state
+	shared_waf_cached || { CFmessage=" CF状态异常"; return 0; }
+	state=$(shared_waf ban-status 2>/dev/null) || { CFmessage=" CF状态异常"; return 0; }
+	CFmessage=$(printf '%s' "$state" | "$WAF_PYTHON" -I -X utf8 -c 'import json,sys; s=json.load(sys.stdin); print(" CF关闭清理待重试" if s.get("cleanupPending") else (" CF同步待核验" if not s["healthy"] else " CF等待同步" if s["pending"] else " CF模式已开启") if s["mode"]=="cloudflare" else " 源站封禁模式")')
+}
+
+web_ban_cron_ready() {
+	if pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1; then return 0; fi
+	if [ -d /run/systemd/system ]; then
+		local unit
+		for unit in cron.service crond.service; do
+			if systemctl cat "$unit" >/dev/null 2>&1; then
+				systemctl enable --now "$unit" || return 1
+				systemctl is-active --quiet "$unit" && return 0
+			fi
+		done
+	elif command -v rc-service >/dev/null 2>&1; then
+		rc-update add crond default && rc-service crond start && rc-service crond status && return 0
+	fi
+	echo "定时服务未就绪，请启动 cron/crond 后重试；封禁到期和CF同步需要它运行。" >&2
+	return 1
+}
+
+web_ban_install() {
+	# Validate and classify legacy state before touching Fail2Ban or Nginx.
+	shared_waf ban-preflight || return $?
+	f2b_install_sshd || return $?
+	if ! ip -j address show >/dev/null 2>&1; then
+		if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+			install iproute || return $?
+		else
+			install iproute2 || return $?
+		fi
+	fi
+	ip -j address show >/dev/null 2>&1 || return 1
+	check_crontab_installed || return $?
+	web_ban_cron_ready || return $?
+	if [ -f /home/web/config/waf/policy.json ]; then
+		shared_waf ban-install
 	else
-		CFmessage=""
+		# New installs begin in detection mode; existing WAF modes stay unchanged.
+		nginx_waf detect || return $?
+		shared_waf ban-install
+	fi
+}
+
+web_cf_enable() {
+	web_ban_install || return $?
+	# Credentials travel over stdin, never through command arguments or logs.
+	printf '%s\n%s\n' "$1" "$2" |
+		"$WAF_PYTHON" -I -c 'import json,sys; print(json.dumps(dict(email=sys.stdin.readline().rstrip("\n"),key=sys.stdin.readline().rstrip("\n"))))' |
+		shared_waf cf-on
+}
+
+web_ban_clear() {
+	if [ -f /home/web/config/waf/bans.json ] || [ -f /home/web/config/waf/ban-cf.json ]; then
+		shared_waf ban-clear || return $?
+	fi
+	fail2ban-client unban --all
+}
+
+web_ban_remove() {
+	if [ -f /home/web/config/waf/bans.json ] || [ -f /home/web/config/waf/ban-cf.json ]; then
+		shared_waf ban-remove || return $?
 	fi
 }
 
@@ -4133,12 +4240,47 @@ define('WP_SITEURL', '$SITE_URL');
 
 
 
+nginx_template_install() {
+	(
+	set -euo pipefail
+	local revision='bdb8cc42fb123b09b02dc5940d2596354efebb87'
+	local expected_sha='c1d5d9706c9f1965c1af3664979cf54e0c9173b9b1c3924aeea49da228347d22'
+	local target=/home/web/nginx.conf download backup='' url size actual_sha
+	local gh_prefix="${gh_proxy:-https://}"
+	[ -d /home/web ] && [ ! -L /home/web ] || { echo "Nginx 配置目录无效" >&2; exit 1; }
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		[ -f "$target" ] && [ ! -L "$target" ] || { echo "Nginx 配置文件类型无效" >&2; exit 1; }
+	fi
+	download=$(mktemp /home/web/.nginx10.conf.download.XXXXXX) || exit 1
+	trap 'rm -f -- "$download" ${backup:+"$backup"}' EXIT
+	url="${gh_prefix}raw.githubusercontent.com/kejilion/nginx/${revision}/nginx10.conf"
+	curl --fail --location --silent --show-error --connect-timeout 10 --max-time 45 --output "$download" "$url" || {
+		echo "Nginx 配置模板下载失败" >&2; exit 1;
+	}
+	size=$(wc -c < "$download")
+	[[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -le 2097152 ] || { echo "Nginx 配置模板大小异常" >&2; exit 1; }
+	actual_sha=$(sha256sum -- "$download" | awk '{print $1}')
+	[ "$actual_sha" = "$expected_sha" ] || { echo "Nginx 配置模板摘要校验失败" >&2; exit 1; }
+	if [ -e "$target" ]; then
+		backup=$(mktemp /home/web/.nginx10.conf.backup.XXXXXX) || exit 1
+		cp -p -- "$target" "$backup" || exit 1
+		if ! cat -- "$download" > "$target"; then
+			cat -- "$backup" > "$target" || { echo "Nginx 配置恢复失败" >&2; exit 86; }
+			echo "Nginx 配置写入失败，已恢复原文件" >&2; exit 1
+		fi
+	else
+		install -m 0644 -- "$download" "$target" || exit 1
+	fi
+	)
+}
+
+
 nginx_br() {
 
 	local mode=$1
 
 	if ! grep -q "kjlion/nginx:alpine" /home/web/docker-compose.yml; then
-		wget -O /home/web/nginx.conf "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/nginx10.conf"
+		nginx_template_install || return $?
 	fi
 
 	if [ "$mode" == "on" ]; then
@@ -4194,7 +4336,7 @@ nginx_zstd() {
 	local mode=$1
 
 	if ! grep -q "kjlion/nginx:alpine" /home/web/docker-compose.yml; then
-		wget -O /home/web/nginx.conf "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/nginx10.conf"
+		nginx_template_install || return $?
 	fi
 
 	if [ "$mode" == "on" ]; then
@@ -4289,8 +4431,10 @@ web_security() {
 			  echo "------------------------"
 			  echo "11. 配置拦截参数                  12. 清除所有拉黑的IP"
 			  echo "------------------------"
-			  echo "21. cloudflare模式                22. 高负载开启5秒盾"
+			  echo "21. 开启CF封禁模式                22. 高负载开启5秒盾"
 			  echo "------------------------"
+			  echo "23. 关闭CF封禁模式（保留源站防护）"
+			  echo "24. 关闭高负载5秒盾"
 			  echo "31. 开启WAF                       32. 关闭WAF"
 			  echo "33. 开启DDOS防御                  34. 关闭DDOS防御"
 			  echo "------------------------"
@@ -4301,18 +4445,7 @@ web_security() {
 			  read -e -p "请输入你的选择: " sub_choice
 			  case $sub_choice in
 				  1)
-					  f2b_install_sshd
-					  cd /etc/fail2ban/filter.d
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/fail2ban-nginx-cc.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-418.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-deny.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-unauthorized.conf
-					  wget ${gh_proxy}raw.githubusercontent.com/linuxserver/fail2ban-confs/master/filter.d/nginx-bad-request.conf
-
-					  cd /etc/fail2ban/jail.d/
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf
-					  sed -i "/cloudflare/d" /etc/fail2ban/jail.d/nginx-docker-cc.conf
-					  f2b_status
+					  web_ban_install || { echo "防护链路配置失败" >&2; continue; }
 					  ;;
 				  5)
 					  echo "------------------------"
@@ -4320,38 +4453,24 @@ web_security() {
 					  echo "------------------------"
 					  ;;
 				  6)
-
-					  echo "------------------------"
-					  local xxx="fail2ban-nginx-cc"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-418"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-bad-request"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-badbots"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-botsearch"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-deny"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-http-auth"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="nginx-unauthorized"
-					  f2b_status_xxx
-					  echo "------------------------"
-					  local xxx="php-url-fopen"
-					  f2b_status_xxx
-					  echo "------------------------"
-
+					  if command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client ping >/dev/null 2>&1 &&
+							  jail_overview=$(fail2ban-client status 2>/dev/null); then
+						  jail_list=$(printf '%s\n' "$jail_overview" | sed -n 's/^.*Jail list:[[:space:]]*//p' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+						  for jail in waf-attack waf-rate; do
+							  if printf '%s\n' "$jail_list" | grep -Fxq -- "$jail" && jail_status=$(fail2ban-client status "$jail" 2>/dev/null); then
+								  printf '%s\n' "$jail_status"
+							  else
+								  echo "网站 Jail $jail 未安装或未加载，请选择 1 安装防御程序后重试。"
+							  fi
+						  done
+						  if printf '%s\n' "$jail_list" | grep -Fxq -- waf-api-invalid && jail_status=$(fail2ban-client status waf-api-invalid 2>/dev/null); then
+							  printf '%s\n' "$jail_status"
+						  fi
+					  else
+						  echo "Fail2Ban 未运行，无法读取网站拦截记录。"
+					  fi
+					  shared_waf ban-status || echo "WAF/CF 状态读取失败，请检查缓存和配置。" >&2
 					  ;;
-
 				  7)
 					  fail2ban-client status
 					  ;;
@@ -4360,6 +4479,7 @@ web_security() {
 
 					  ;;
 				  9)
+					  web_ban_remove || { echo "封禁清理未完成，停止卸载" >&2; continue; }
 					  remove fail2ban
 					  rm -rf /etc/fail2ban
 					  crontab -l | grep -v "CF-Under-Attack.sh" | crontab - 2>/dev/null
@@ -4369,38 +4489,36 @@ web_security() {
 
 				  11)
 					  install nano
-					  nano /etc/fail2ban/jail.d/nginx-docker-cc.conf
+					  echo "调整 waf-attack / waf-rate 的 maxretry、findtime、bantime（60~3600秒）；不修改过滤器和动作。"
+					  nano /etc/fail2ban/jail.d/zz-waf-managed.local
+					  fail2ban-client -t || { echo "配置检查失败" >&2; continue; }
 					  f2b_status
 					  break
 					  ;;
 
 				  12)
-					  fail2ban-client unban --all
+					  web_ban_clear || continue
 					  ;;
 
 				  21)
-					  send_stats "cloudflare模式"
-					  echo "到cf后台右上角我的个人资料，选择左侧API令牌，获取Global API Key"
-					  echo "https://dash.cloudflare.com/login"
-					  read -e -p "输入CF的账号: " cfuser
-					  read -e -p "输入CF的Global API Key: " cftoken
-
-					  wget -O /home/web/conf.d/default.conf ${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default11.conf
-					  docker exec nginx nginx -s reload
-
-					  cd /etc/fail2ban/jail.d/
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf
-
-					  cd /etc/fail2ban/action.d
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/cloudflare-docker.conf
-
-					  sed -i "s/kejilion@outlook.com/$cfuser/g" /etc/fail2ban/action.d/cloudflare-docker.conf
-					  sed -i "s/APIKEY00000/$cftoken/g" /etc/fail2ban/action.d/cloudflare-docker.conf
-					  f2b_status
-
-					  echo "已配置cloudflare模式，可在cf后台，站点-安全性-事件中查看拦截记录"
+					  echo "使用邮箱和 Global API Key；API Token 用户邮箱留空，需要 Zone Read / Zone WAF Edit。"
+					  echo "按域名同步封禁，不再创建账号级 IP 黑名单。"
+					  read -r -p "输入CF邮箱（Token留空）: " cfuser
+					  read -r -s -p "输入CF Key或Token: " cftoken; echo
+					  if web_cf_enable "$cfuser" "$cftoken"; then
+						  echo "CF封禁模式已配置，事件按分钟同步，源站封禁持续有效"
+					  else
+						  echo "CF同步未完成，请检查 k web waf ban-status" >&2
+					  fi
+					  unset cfuser cftoken
 					  ;;
-
+				  23)
+					  shared_waf cf-off || { echo "CF规则清理未完成，凭据已保留供重试" >&2; continue; }
+					  ;;
+				  24)
+					  kpanel_ldnmp_cloudflare_shield_off || { echo "高负载5秒盾关闭失败，请检查定时任务" >&2; continue; }
+					  echo "高负载5秒盾已关闭，CF封禁模式与源站防护保持不变"
+					  ;;
 				  22)
 					  send_stats "高负载开启5秒盾"
 					  echo -e "${gl_huang}网站每5分钟自动检测，当达检测到高负载会自动开盾，低负载也会自动关闭5秒盾。${gl_bai}"
@@ -4417,15 +4535,15 @@ web_security() {
 					  cd ~
 					  install jq bc
 					  check_crontab_installed
-					  curl -sS -O ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/CF-Under-Attack.sh
-					  chmod +x CF-Under-Attack.sh
-					  sed -i "s/AAAA/$cfuser/g" ~/CF-Under-Attack.sh
-					  sed -i "s/BBBB/$cftoken/g" ~/CF-Under-Attack.sh
-					  sed -i "s/CCCC/$cfzonID/g" ~/CF-Under-Attack.sh
+					  if ! cf_shield_install_script "$cfuser" "$cftoken" "$cfzonID"; then
+						  unset cfuser cftoken cfzonID
+						  continue
+					  fi
 
-					  local cron_job="*/5 * * * * ~/CF-Under-Attack.sh"
+					  local cron_job="*/5 * * * * /root/CF-Under-Attack.sh"
 
-					  local existing_cron=$(crontab -l 2>/dev/null | grep -F "$cron_job")
+					  local existing_cron
+					  existing_cron=$(crontab -l 2>/dev/null | grep -F "CF-Under-Attack.sh" || true)
 
 					  if [ -z "$existing_cron" ]; then
 						  (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
@@ -4433,6 +4551,7 @@ web_security() {
 					  else
 						  echo "自动开盾脚本已存在，无需添加"
 					  fi
+					  unset cfuser cftoken cfzonID
 
 					  ;;
 
@@ -5811,6 +5930,15 @@ check_f2b_status() {
 
 f2b_install_sshd() {
 
+	if command -v apt &>/dev/null; then
+		install rsyslog || return 1
+		/bin/systemctl enable --now rsyslog.service || return 1
+		if [ ! -e /var/log/auth.log ]; then
+			touch /var/log/auth.log || return 1
+			chmod 0640 /var/log/auth.log || return 1
+		fi
+	fi
+
 	docker rm -f fail2ban >/dev/null 2>&1
 	install fail2ban || return 1
 
@@ -5826,11 +5954,6 @@ f2b_install_sshd() {
 			chmod 0600 /var/log/secure || return 1
 			command -v restorecon >/dev/null 2>&1 && restorecon /var/log/secure || true
 		fi
-	fi
-
-	if command -v apt &>/dev/null; then
-		install rsyslog || return 1
-		/bin/systemctl enable --now rsyslog.service || return 1
 	fi
 
 	if command -v apk >/dev/null 2>&1; then
@@ -16112,6 +16235,167 @@ kpanel_ldnmp_component() {
 		"$(kpanel_ldnmp_escape "$image")" "$(kpanel_ldnmp_escape "$version")" "$(kpanel_ldnmp_escape "$digest")"
 }
 
+kpanel_ldnmp_site_jail_json() {
+	local jail="$1" running="${2:-false}" status="" jails="" value="" current=0 total=0
+	if [ "$running" = true ] && jails=$(fail2ban-client status 2>/dev/null) &&
+		printf '%s\n' "$jails" | sed -n 's/^.*Jail list:[[:space:]]*//p' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -Fxq -- "$jail" &&
+		status=$(fail2ban-client status "$jail" 2>/dev/null); then
+		value=$(printf '%s\n' "$status" | awk -F: '/Currently banned[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		current="$value"
+		value=$(printf '%s\n' "$status" | awk -F: '/Total banned[[:space:]]*:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')
+		case "$value" in ''|*[!0-9]*) value=0 ;; esac
+		total="$value"
+		printf '{"name":"%s","available":true,"currentlyBanned":%s,"totalBanned":%s}' "$jail" "$current" "$total"
+	else
+		printf '{"name":"%s","available":false,"currentlyBanned":0,"totalBanned":0}' "$jail"
+	fi
+}
+
+kpanel_ldnmp_migration_json() {
+	local raw="${1:-}" fallback='{"state":"current","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}'
+	[ -n "$raw" ] || { printf '%s' "$fallback"; return 0; }
+	printf '%s' "$raw" | "$WAF_PYTHON" -I -c '
+import json,sys
+root=json.load(sys.stdin)
+s=root.get("migration")
+if not isinstance(s,dict):
+ print(json.dumps({"state":"unknown","importedRecords":0,"apiJailEnabled":False,"legacyCFDetected":False,"cfReentryRequired":False,"legacyReconcilerStopped":False},separators=(",",":")));raise SystemExit
+state=s.get("state","unknown")
+if state=="legacy-ready": state="legacy-pending"
+if state not in {"current","legacy-pending","legacy-imported","legacy-compatible"}: state="unknown"
+try: imported=int(s.get("importedRecords",0))
+except (TypeError,ValueError): imported=0
+if imported<0 or imported>10000: imported=0
+out={"state":state,"importedRecords":imported,"apiJailEnabled":s.get("apiJailEnabled") is True,"legacyCFDetected":s.get("legacyCFDetected") is True,"cfReentryRequired":s.get("cfReentryRequired") is True,"legacyReconcilerStopped":s.get("legacyReconcilerStopped") is True}
+print(json.dumps(out,separators=(",",":")))' 2>/dev/null || printf '{"state":"unknown","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}'
+}
+
+kpanel_ldnmp_fail2ban_logs_json() {
+	local log_file="${1:-/var/log/fail2ban.log}" available=false separator="" line escaped
+	local -a lines=()
+	if [ -r "$log_file" ]; then
+		available=true
+		mapfile -t lines < <(tail -n 500 "$log_file" 2>/dev/null | grep -F -e '[waf-attack]' -e '[waf-rate]' -e '[waf-api-invalid]' | tail -n 20)
+	fi
+	printf '{"available":%s,"entries":[' "$available"
+	for line in "${lines[@]}"; do
+		line=$(printf '%s' "$line" | LC_ALL=C tr -d '\001-\010\013\014\016-\037')
+		line="${line:0:1024}"
+		escaped=$(kpanel_ldnmp_escape "$line")
+		printf '%s"%s"' "$separator" "$escaped"
+		separator=,
+	done
+	printf ']}'
+}
+
+kpanel_ldnmp_ddos_rules_present() {
+	local count=0
+	iptables -C DOCKER-USER -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C DOCKER-USER -p tcp --syn -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C DOCKER-USER -p udp -m limit --limit 3000/s -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C DOCKER-USER -p udp -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p tcp --syn -m limit --limit 500/s --limit-burst 100 -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p tcp --syn -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p udp -m limit --limit 3000/s -j ACCEPT >/dev/null 2>&1 && count=$((count + 1))
+	iptables -C INPUT -p udp -j DROP >/dev/null 2>&1 && count=$((count + 1))
+	printf '%s' "$count"
+}
+
+kpanel_ldnmp_cloudflare_status_json() {
+	local raw="${1:-}" status='{"mode":"local","configured":false,"running":false,"healthy":false,"pending":false,"cleanupPending":false,"activeBans":0}'
+	[ -n "$raw" ] || { printf '%s' "$status"; return 0; }
+	status=$(printf '%s' "$raw" | "$WAF_PYTHON" -I -c '
+import json,sys
+s=json.load(sys.stdin)
+mode=s.get("mode")
+if mode not in {"cloudflare","local"}: mode="unknown"
+try: active=int(s.get("activeBans",0))
+except (TypeError,ValueError): active=0
+if active < 0 or active > 1000000: active=0
+out={"mode":mode,"configured":s.get("configured") is True,"running":s.get("running") is True,"healthy":s.get("healthy") is True,"pending":s.get("pending") is True,"cleanupPending":s.get("cleanupPending") is True,"activeBans":active}
+print(json.dumps(out,separators=(",",":")))' 2>/dev/null) || status='{"mode":"unknown","configured":false,"running":false,"healthy":false,"pending":false,"cleanupPending":false,"activeBans":0}'
+	printf '%s' "$status"
+}
+
+kpanel_ldnmp_cloudflare_shield_off() {
+	local current="" updated="" listing="" script_path="${1:-/root/CF-Under-Attack.sh}"
+	command -v crontab >/dev/null 2>&1 || return 1
+	if listing=$(crontab -l 2>&1); then
+		current="$listing"
+	else
+		if [[ "$listing" == *"no crontab for "* ]] || [[ "$listing" == *"can't open "* && "$listing" == *"No such file or directory"* ]]; then
+		current=""
+		else
+			return 1
+		fi
+	fi
+	updated=$(printf '%s\n' "$current" | grep -Fv 'CF-Under-Attack.sh') || true
+	if [ "$updated" != "$current" ]; then
+		printf '%s\n' "$updated" | crontab - || return 1
+	fi
+	rm -f -- "$script_path"
+}
+
+kpanel_ldnmp_protection_json() {
+	local waf="$1" waf_mode="$2" fail2ban_installed=false fail2ban=false
+	local cf_raw="" cf_json cf_status_known=false cloudflare=false ddos_count=0 ddos=false ddos_rules_available=false shield_scheduled=false shield_script=false shield_available=false cron_listing=""
+	local first="" second="" third="" logs="" migration_json='{"state":"current","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}' legacy_cf=false
+	command -v fail2ban-client >/dev/null 2>&1 && fail2ban_installed=true
+	if [ "$fail2ban_installed" = true ] && fail2ban-client ping >/dev/null 2>&1; then fail2ban=true; fi
+	first=$(kpanel_ldnmp_site_jail_json waf-attack "$fail2ban")
+	second=$(kpanel_ldnmp_site_jail_json waf-rate "$fail2ban")
+	third=$(kpanel_ldnmp_site_jail_json waf-api-invalid "$fail2ban")
+	logs=$(kpanel_ldnmp_fail2ban_logs_json)
+	if { [ -f /home/web/config/waf/ban-cf.json ] || [ -f /home/web/config/waf/ban-migration.json ]; } && shared_waf_cached >/dev/null 2>&1; then
+		cf_raw=$(shared_waf ban-status 2>/dev/null) || cf_raw=""
+		[ -n "$cf_raw" ] && cf_status_known=true
+		[ -n "$cf_raw" ] && migration_json=$(kpanel_ldnmp_migration_json "$cf_raw")
+	fi
+	if [ ! -f /home/web/config/waf/ban-migration.json ] && [ ! -f /home/web/config/waf/ban-cf.json ]; then
+		if [ -f /home/web/config/waf/state.json ] || [ -f /etc/fail2ban/jail.d/zz-waf-api-invalid.local ] ||
+		   [ -f /etc/systemd/system/kejilion-waf.service ] || [ -f /etc/fail2ban/action.d/cloudflare-docker.conf ] ||
+		   grep -Fq '# Managed shared WAF; only trusted defence events, isolated by canonical site and client.' /etc/fail2ban/jail.d/zz-waf-managed.local 2>/dev/null; then
+			[ -e /etc/fail2ban/action.d/cloudflare-docker.conf ] && legacy_cf=true
+			migration_json=$(printf '{"state":"legacy-pending","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":%s,"cfReentryRequired":%s,"legacyReconcilerStopped":false}' "$legacy_cf" "$legacy_cf")
+			if shared_waf_cached >/dev/null 2>&1; then
+				cf_raw=$(shared_waf ban-preflight 2>/dev/null) || cf_raw=""
+				[ -n "$cf_raw" ] && migration_json=$(kpanel_ldnmp_migration_json "$cf_raw")
+			fi
+		fi
+	fi
+	if { [ -f /home/web/config/waf/ban-migration.json ] || [ -f /home/web/config/waf/ban-cf.json ]; } && [ "$cf_status_known" = false ]; then
+		migration_json='{"state":"unknown","importedRecords":0,"apiJailEnabled":false,"legacyCFDetected":false,"cfReentryRequired":false,"legacyReconcilerStopped":false}'
+	fi
+	cf_json=$(kpanel_ldnmp_cloudflare_status_json "$cf_raw")
+	if [ -f /home/web/config/waf/ban-cf.json ] && [ "$cf_status_known" = false ]; then
+		cf_json='{"mode":"unknown","configured":false,"running":false,"healthy":false,"pending":false,"cleanupPending":false,"activeBans":0}'
+	fi
+	if [ -n "$cf_raw" ] && printf '%s' "$cf_json" | "$WAF_PYTHON" -I -c 'import json,sys; s=json.load(sys.stdin); sys.exit(not (s["mode"]=="cloudflare" and s["healthy"]))' 2>/dev/null; then
+		cloudflare=true
+	else
+		cloudflare=false
+	fi
+	command -v iptables >/dev/null 2>&1 && ddos_rules_available=true
+	ddos_count=$(kpanel_ldnmp_ddos_rules_present)
+	[ "$ddos_count" -eq 8 ] && ddos=true
+	[ -f /root/CF-Under-Attack.sh ] && shield_script=true
+	if command -v crontab >/dev/null 2>&1; then
+		if cron_listing=$(crontab -l 2>&1); then
+			shield_available=true
+		elif [[ "$cron_listing" == *"no crontab for "* ]] || [[ "$cron_listing" == *"can't open "* && "$cron_listing" == *"No such file or directory"* ]]; then
+			shield_available=true
+			cron_listing=""
+		fi
+		if [ "$shield_available" = true ]; then
+			printf '%s' "$cron_listing" | grep -Fq 'CF-Under-Attack.sh' && shield_scheduled=true
+		fi
+	fi
+	printf '{"fail2ban":%s,"fail2banInstalled":%s,"waf":%s,"wafMode":"%s","cloudflare":%s,"cloudflareStatus":%s,"banMigration":%s,"ddos":%s,"ddosRuleCount":%s,"ddosRuleExpected":8,"ddosRulesAvailable":%s,"cloudflareShield":{"available":%s,"scheduled":%s,"scriptPresent":%s},"siteJails":[%s,%s,%s],"fail2banLogs":%s}' \
+		"$fail2ban" "$fail2ban_installed" "$waf" "$(kpanel_ldnmp_escape "$waf_mode")" "$cloudflare" "$cf_json" \
+		"$migration_json" "$ddos" "$ddos_count" "$ddos_rules_available" "$shield_available" "$shield_scheduled" "$shield_script" "$first" "$second" "$third" "$logs"
+}
+
 ldnmp_environment_status() {
 	local count=0 running=0 state=absent profile=none health=unknown
 	for name in nginx mysql php redis; do
@@ -16147,15 +16431,14 @@ ldnmp_environment_status() {
 		  docker inspect -f '{{.Id}} {{.Image}} {{.State.Status}}' nginx mysql php php74 redis 2>/dev/null; } |
 			sha256sum | awk '{print $1}'
 	)
-	local fail2ban=false waf=false waf_mode=off cloudflare=false ddos=false mode=custom gzip=false brotli=false zstd=false
-	command -v fail2ban-client >/dev/null 2>&1 && fail2ban=true
+	local waf=false waf_mode=off mode=custom gzip=false brotli=false zstd=false protection_json
 	grep -qE '^[[:space:]]*modsecurity on;' /home/web/nginx.conf 2>/dev/null && waf=true
 	if [ -f /home/web/config/waf/policy.json ]; then
 		waf_mode=$(shared_waf_mode 2>/dev/null) || waf_mode=unknown
 		case "$waf_mode" in on) waf=true ;; *) waf=false ;; esac
 	elif [ "$waf" = true ]; then waf_mode=legacy; fi
-	[ -f /etc/fail2ban/action.d/cloudflare-docker.conf ] && cloudflare=true
-	iptables -C INPUT -p tcp --syn -j DROP >/dev/null 2>&1 && ddos=true
+	protection_json=$(kpanel_ldnmp_protection_json "$waf" "$waf_mode")
+	# DDoS status is counted from all fixed rules in kpanel_ldnmp_protection_json.
 	docker exec mysql grep -q 4096M /etc/mysql/conf.d/custom_mysql_config.cnf 2>/dev/null && mode=high
 	[ "$mode" = custom ] && docker exec mysql test -f /etc/mysql/conf.d/custom_mysql_config.cnf >/dev/null 2>&1 && mode=standard
 	grep -qE '^[[:space:]]*gzip[[:space:]]+on;' /home/web/nginx.conf 2>/dev/null && gzip=true
@@ -16177,12 +16460,12 @@ ldnmp_environment_status() {
 	kpanel_ldnmp_component nginx true; printf ','; kpanel_ldnmp_component mysql true; printf ','
 	kpanel_ldnmp_component php true; printf ','; kpanel_ldnmp_component php74 false; printf ','
 	kpanel_ldnmp_component redis true
-	printf '],"protection":{"fail2ban":%s,"waf":%s,"wafMode":"%s","cloudflare":%s,"ddos":%s},"optimization":{"mode":"%s","gzip":%s,"brotli":%s,"zstd":%s},"observedAt":"%s"}\n' \
-		"$fail2ban" "$waf" "$waf_mode" "$cloudflare" "$ddos" "$mode" "$gzip" "$brotli" "$zstd" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	printf '],"protection":%s,"optimization":{"mode":"%s","gzip":%s,"brotli":%s,"zstd":%s},"observedAt":"%s"}\n' \
+		"$protection_json" "$mode" "$gzip" "$brotli" "$zstd" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
 ldnmp_environment_catalog() {
-	printf '%s\n' '{"protocolVersion":"1","installProfiles":[{"id":"full","label":"完整 LDNMP"},{"id":"nginx","label":"仅 Nginx"}],"protectionActions":["fail2ban-install","fail2ban-uninstall","unban-all","waf-on","waf-off","ddos-on","ddos-off","cloudflare-fail2ban","cloudflare-shield"],"optimizationActions":["standard","high","gzip-on","gzip-off","brotli-on","brotli-off","zstd-on","zstd-off"],"updateComponents":[{"id":"nginx","versions":["latest"]},{"id":"mysql","versions":["latest","8.0","8.3","8.4","9.0"]},{"id":"php","versions":["7.4","8.0","8.1","8.2","8.3"]},{"id":"redis","versions":["latest"]},{"id":"all","versions":["latest"]}]}'
+	printf '%s\n' '{"protocolVersion":"1","installProfiles":[{"id":"full","label":"完整 LDNMP"},{"id":"nginx","label":"仅 Nginx"}],"protectionActions":["fail2ban-install","fail2ban-uninstall","unban-all","waf-on","waf-off","ddos-on","ddos-off","cloudflare-fail2ban","cloudflare-off","cloudflare-shield","cloudflare-shield-off"],"optimizationActions":["standard","high","gzip-on","gzip-off","brotli-on","brotli-off","zstd-on","zstd-off"],"updateComponents":[{"id":"nginx","versions":["latest"]},{"id":"mysql","versions":["latest","8.0","8.3","8.4","9.0"]},{"id":"php","versions":["7.4","8.0","8.1","8.2","8.3"]},{"id":"redis","versions":["latest"]},{"id":"all","versions":["latest"]}]}'
 }
 
 ldnmp_environment_install() {
@@ -16204,18 +16487,63 @@ ldnmp_environment_install() {
 	return 0
 }
 
+cf_shield_install_script() {
+	(
+	set -euo pipefail
+	local email="${1:-}" token="${2:-}" zone="${3:-}"
+	local target="${4:-/root/CF-Under-Attack.sh}" directory revision expected_sha url download stage actual_sha size line
+	local quoted_email quoted_token quoted_zone
+	local gh_prefix="${gh_proxy:-https://}"
+	[ -n "$email" ] && [ -n "$token" ] && [ -n "$zone" ] || { echo "Cloudflare 凭据不能为空" >&2; exit 1; }
+	[[ "$email$token$zone" != *$'\n'* && "$email$token$zone" != *$'\r'* ]] || { echo "Cloudflare 凭据格式无效" >&2; exit 1; }
+	[ "${#email}" -le 320 ] && [ "${#token}" -le 512 ] && [ "${#zone}" -le 128 ] || { echo "Cloudflare 凭据长度超限" >&2; exit 1; }
+	printf -v quoted_email '%q' "$email"
+	printf -v quoted_token '%q' "$token"
+	printf -v quoted_zone '%q' "$zone"
+	revision='f02b7b8d59fd090006304a998ea2b3410ae5f736'
+	expected_sha='781265062ba74bdeccb443177a9580190942c379dbe1e19a78ba1c774400086c'
+	directory=$(dirname -- "$target")
+	[ -d "$directory" ] && [ ! -L "$directory" ] || { echo "Cloudflare 防护目录无效" >&2; exit 1; }
+	download=$(mktemp "$directory/.CF-Under-Attack.download.XXXXXX") || exit 1
+	stage=$(mktemp "$directory/.CF-Under-Attack.stage.XXXXXX") || { rm -f -- "$download"; exit 1; }
+	trap 'rm -f -- "$download" "$stage"' EXIT
+	url="${gh_prefix}raw.githubusercontent.com/kejilion/sh/${revision}/CF-Under-Attack.sh"
+	if ! curl --fail --location --silent --show-error --connect-timeout 10 --max-time 45 --output "$download" "$url"; then
+		echo "Cloudflare 五秒盾脚本下载失败" >&2
+		exit 1
+	fi
+	size=$(wc -c < "$download")
+	[[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -le 65536 ] || { echo "Cloudflare 五秒盾脚本大小异常" >&2; exit 1; }
+	actual_sha=$(sha256sum -- "$download" | awk '{print $1}')
+	[ "$actual_sha" = "$expected_sha" ] || { echo "Cloudflare 五秒盾脚本摘要校验失败" >&2; exit 1; }
+	grep -Fxq 'EMAIL="AAAA"' "$download" && grep -Fxq 'API_KEY="BBBB"' "$download" && grep -Fxq 'ZONE_ID="CCCC"' "$download" || {
+		echo "Cloudflare 五秒盾脚本占位符异常" >&2; exit 1;
+	}
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		case "$line" in
+			'EMAIL="AAAA"') printf 'EMAIL=%s\n' "$quoted_email" ;;
+			'API_KEY="BBBB"') printf 'API_KEY=%s\n' "$quoted_token" ;;
+			'ZONE_ID="CCCC"') printf 'ZONE_ID=%s\n' "$quoted_zone" ;;
+			*) printf '%s\n' "$line" ;;
+		esac
+	done < "$download" > "$stage"
+	grep -Fxq -- "EMAIL=$quoted_email" "$stage" && grep -Fxq -- "API_KEY=$quoted_token" "$stage" && grep -Fxq -- "ZONE_ID=$quoted_zone" "$stage" || {
+		echo "Cloudflare 五秒盾凭据写入失败" >&2; exit 1;
+	}
+	chmod 700 "$stage"
+	bash -n "$stage" || { echo "Cloudflare 五秒盾脚本语法校验失败" >&2; exit 1; }
+	mv -f -- "$stage" "$target"
+	)
+}
+
 ldnmp_protection_action_apply() {
-	local cfuser="" cftoken="" cfzone="" secret_content=""
+	local cfuser="" cftoken="" cfzone=""
 	case "$1" in
-		fail2ban-install)
-			f2b_install_sshd
-			mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
-			curl -sS -o /etc/fail2ban/filter.d/fail2ban-nginx-cc.conf "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/fail2ban-nginx-cc.conf"
-			curl -sS -o /etc/fail2ban/jail.d/nginx-docker-cc.conf "${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf"
-			sed -i '/cloudflare/d' /etc/fail2ban/jail.d/nginx-docker-cc.conf
-			fail2ban-client reload ;;
-		fail2ban-uninstall) remove fail2ban; rm -rf /etc/fail2ban ;;
-		unban-all) fail2ban-client unban --all ;;
+		fail2ban-install) web_ban_install ;;
+		fail2ban-uninstall) web_ban_remove || return $?; remove fail2ban; rm -rf /etc/fail2ban ;;
+		unban-all) web_ban_clear ;;
+		cloudflare-off) shared_waf cf-off ;;
+		cloudflare-shield-off) kpanel_ldnmp_cloudflare_shield_off ;;
 		waf-on) nginx_waf on ;; waf-off) nginx_waf off ;;
 		ddos-on) enable_ddos_defense ;; ddos-off) disable_ddos_defense ;;
 		cloudflare-fail2ban|cloudflare-shield)
@@ -16228,33 +16556,15 @@ ldnmp_protection_action_apply() {
 			cftoken=$(sed -n '2p' "$KJ_LDNMP_SECRET_FILE")
 			cfzone=$(sed -n '3p' "$KJ_LDNMP_SECRET_FILE")
 			rm -f -- "$KJ_LDNMP_SECRET_FILE"
-			[ -n "$cfuser" ] && [ -n "$cftoken" ] || return 2
+			[ -n "$cftoken" ] || return 2
 			if [ "$1" = cloudflare-fail2ban ]; then
-				wget -O /home/web/conf.d/default.conf "${gh_proxy}raw.githubusercontent.com/kejilion/nginx/main/default11.conf"
-				docker exec nginx nginx -s reload
-				mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/action.d
-				curl -sS -o /etc/fail2ban/jail.d/nginx-docker-cc.conf \
-					"${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/nginx-docker-cc.conf"
-				curl -sS -o /etc/fail2ban/action.d/cloudflare-docker.conf \
-					"${gh_proxy}raw.githubusercontent.com/kejilion/config/main/fail2ban/cloudflare-docker.conf"
-				secret_content=$(< /etc/fail2ban/action.d/cloudflare-docker.conf)
-				secret_content=${secret_content//kejilion@outlook.com/$cfuser}
-				secret_content=${secret_content//APIKEY00000/$cftoken}
-				printf '%s\n' "$secret_content" > /etc/fail2ban/action.d/cloudflare-docker.conf
-				chmod 600 /etc/fail2ban/action.d/cloudflare-docker.conf
-				f2b_status
+				web_cf_enable "$cfuser" "$cftoken" || return $?
 			else
 				[ -n "$cfzone" ] || return 2
 				cd /root || return 1
 				install jq bc
 				check_crontab_installed
-				curl -sS -o CF-Under-Attack.sh "${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/CF-Under-Attack.sh"
-				chmod 700 CF-Under-Attack.sh
-				secret_content=$(< CF-Under-Attack.sh)
-				secret_content=${secret_content//AAAA/$cfuser}
-				secret_content=${secret_content//BBBB/$cftoken}
-				secret_content=${secret_content//CCCC/$cfzone}
-				printf '%s\n' "$secret_content" > CF-Under-Attack.sh
+				cf_shield_install_script "$cfuser" "$cftoken" "$cfzone" || return $?
 				local cron_job="*/5 * * * * /root/CF-Under-Attack.sh"
 				(crontab -l 2>/dev/null | grep -Fv "/root/CF-Under-Attack.sh"; echo "$cron_job") | crontab -
 			fi
@@ -16266,7 +16576,11 @@ ldnmp_protection_action_apply() {
 ldnmp_protection_action() {
 	# Shared WAF owns its full configuration transaction and readiness verification.
 	# The legacy snapshot below cannot restore that write set and must not wrap it.
-	case "$1" in waf-on) nginx_waf on; return $? ;; waf-off) nginx_waf off; return $? ;; esac
+	case "$1" in
+		waf-on) nginx_waf on; return $? ;; waf-off) nginx_waf off; return $? ;;
+		fail2ban-install|fail2ban-uninstall|cloudflare-fail2ban|cloudflare-off|cloudflare-shield-off|unban-all)
+			ldnmp_protection_action_apply "$@"; return $? ;;
+	esac
 	local action="$1" snapshot rc=0 fail2ban_existed=false
 	snapshot=$(mktemp -d /home/.kpanel-ldnmp-protection.XXXXXX) || return 1
 	if [ -d /etc/fail2ban ]; then
@@ -16476,6 +16790,7 @@ ldnmp_restore_action() {
 	tar -xzf "$archive" -C "$stage" || { rm -rf "$stage"; return 1; }
 	docker compose -f "$stage/web/docker-compose.yml" config -q || { rm -rf "$stage"; return 1; }
 	kpanel_ldnmp_event restore_switch 60 "正在原子切换 /home/web"
+	web_ban_remove || { rm -rf "$stage"; return 1; }
 	if [ -d /home/web ]; then
 		cd /home/web || return 1
 		old_running_services=$(docker compose ps --services --filter status=running 2>/dev/null | tr '\n' ' ')
@@ -16490,7 +16805,12 @@ ldnmp_restore_action() {
 		return 1
 	fi
 	rm -rf "$stage"; cd /home/web || return 1
-	if docker compose up -d && docker exec nginx nginx -t >/dev/null 2>&1; then rm -rf "$rollback"; return 0; fi
+	if docker compose up -d && docker exec nginx nginx -t >/dev/null 2>&1; then
+		web_ban_remove || { echo "备份已恢复，但封禁状态清理未完成，需人工检查" >&2; return 86; }
+		rm -rf "$rollback"
+		echo "站点已恢复；如需累计封禁，请重新安装防护并开启CF模式。"
+		return 0
+	fi
 	docker compose down >/dev/null 2>&1; rm -rf /home/web
 	[ -d "$rollback" ] && mv "$rollback" /home/web
 	cd /home/web || return 1
@@ -16502,6 +16822,7 @@ ldnmp_restore_action() {
 
 ldnmp_uninstall_action() {
 	if [ "${1:-false}" = true ]; then ldnmp_backup_action || return $?; fi
+	web_ban_remove || return $?
 	if [ -d /home/web ]; then
 		cd /home/web || return 1
 		docker compose down --rmi all || return 1
@@ -17490,6 +17811,7 @@ linux_ldnmp() {
 	  fi
 
 	  if [ -n "$filename" ]; then
+		  web_ban_remove || { echo "CF封禁清理未完成，停止还原" >&2; break; }
 		  cd /home/web/ > /dev/null 2>&1
 		  docker compose down > /dev/null 2>&1
 		  rm -rf /home/web > /dev/null 2>&1
@@ -17501,6 +17823,7 @@ linux_ldnmp() {
 		  install_docker
 		  install_certbot
 		  install_ldnmp
+		  web_ban_remove || echo "备份封禁状态需人工检查，请勿删除CF凭据。" >&2
 	  else
 		  echo "没有找到压缩包。"
 	  fi

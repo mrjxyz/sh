@@ -304,7 +304,7 @@ class TransactionTests(unittest.TestCase):
         updater.execute_update(self.root, self.directory, 'waf', 'https://')
         self.assertEqual(json.loads((self.directory / 'journal.json').read_text())['phase'], 'switching')
         self.assertEqual((self.root / 'nginx.conf').read_bytes(), self.initial['nginx.conf'])
-        self.assertEqual(json.loads((self.root / 'docker-compose.yml').read_text())['services']['nginx']['image'], 'kjlion/nginx:alpine')
+        self.assertEqual(json.loads((self.root / 'docker-compose.yml').read_text())['services']['nginx']['image'], updater.WAF_CANDIDATE_IMAGE)
         updater.rollback(self.root, self.directory)  # A later policy/configuration failure.
         self.assertEqual((self.root / 'docker-compose.yml').read_bytes(), self.initial['docker-compose.yml'])
         self.assertEqual(self.images, self.old_images)
@@ -332,7 +332,8 @@ class TransactionTests(unittest.TestCase):
         container['Config']['Labels']['com.docker.compose.project.config_files'] += ',' + str(self.root / 'docker-compose.override.yml')
         name, result = updater.waf_image_plan(self.root, self.model, container)
         self.assertEqual(name, 'docker-compose.override.yml')
-        self.assertEqual(result.decode(), original.replace('image: ${NGINX_IMAGE:-nginx:alpine} # old', 'image: kjlion/nginx:alpine'))
+        self.assertEqual(result.decode(), original.replace('image: ${NGINX_IMAGE:-nginx:alpine} # old', 'image: ' + updater.WAF_CANDIDATE_IMAGE))
+        self.assertRegex(updater.WAF_CANDIDATE_IMAGE, r'^kjlion/nginx:alpine@sha256:[0-9a-f]{64}$')
 
     def test_waf_custom_image_or_build_cannot_be_automatically_replaced(self):
         self.prepare_waf()
@@ -341,6 +342,41 @@ class TransactionTests(unittest.TestCase):
             model['services']['nginx'].update(changes)
             with self.assertRaisesRegex(ValueError, '自定义镜像'):
                 updater.waf_image_plan(self.root, model, self.images['nginx'])
+
+    def test_waf_image_plan_accepts_owned_tag_alias_and_current_pin(self):
+        self.prepare_waf()
+        for image in ('kjlion/nginx:alpine', 'docker.io/kjlion/nginx:alpine', updater.WAF_CANDIDATE_IMAGE):
+            with self.subTest(image=image):
+                model = copy.deepcopy(self.model)
+                model['services']['nginx']['image'] = image
+                name, data = updater.waf_image_plan(self.root, model, self.images['nginx'])
+                self.assertEqual(name, 'docker-compose.yml')
+                self.assertEqual(json.loads(data)['services']['nginx']['image'], updater.WAF_CANDIDATE_IMAGE)
+
+    def test_managed_waf_tag_is_pinned_during_regular_upgrade(self):
+        self.prepare_waf()
+        self.model['services']['nginx']['image'] = 'kjlion/nginx:alpine'
+        self.images['nginx']['Config']['Image'] = 'kjlion/nginx:alpine'
+        self.seed('docker-compose.yml', json.dumps(self.model))
+        updater.snapshot(self.root, self.directory)
+        updater.execute_update(self.root, self.directory, 'nginx', 'https://')
+        compose = json.loads((self.root / 'docker-compose.yml').read_text(encoding='utf-8'))
+        self.assertEqual(compose['services']['nginx']['image'], updater.WAF_CANDIDATE_IMAGE)
+        pinned = json.loads((self.directory / 'pinned.json').read_text(encoding='utf-8'))
+        self.assertEqual(pinned['services']['nginx']['image'], updater.WAF_CANDIDATE_IMAGE)
+        self.assertTrue(any('pull' in call and str(self.directory / 'pinned.json') in call for call in self.calls))
+
+    def test_first_managed_image_upgrade_pins_when_running_container_is_official(self):
+        self.prepare_waf()
+        self.model['services']['nginx']['image'] = 'kjlion/nginx:alpine'
+        self.seed('docker-compose.yml', json.dumps(self.model))
+        updater.snapshot(self.root, self.directory)
+        updater.execute_update(self.root, self.directory, 'nginx', 'https://')
+        compose = json.loads((self.root / 'docker-compose.yml').read_text(encoding='utf-8'))
+        self.assertEqual(compose['services']['nginx']['image'], updater.WAF_CANDIDATE_IMAGE)
+        pinned = json.loads((self.directory / 'pinned.json').read_text(encoding='utf-8'))
+        self.assertEqual(pinned['services']['nginx']['image'], updater.WAF_CANDIDATE_IMAGE)
+        self.assertTrue(any('pull' in call and str(self.directory / 'pinned.json') in call for call in self.calls))
 
     def test_success_migrates_common_files_preserves_sites_and_persists_verified_baselines(self):
         original_inode = (self.root / 'nginx.conf').stat().st_ino
